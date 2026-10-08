@@ -569,6 +569,69 @@ int main() {
         assert_test(!req_20.valid && req_20.is_error(), "Reject HTTP/2.0");
     }
 
+    // Test 51: Bare LF in header value -> Error
+    {
+        std::string raw = "GET / HTTP/1.1\r\nHost: example.com\r\nX-Header: val\nue\r\n\r\n";
+        HttpRequest req = HttpParser::parse(raw);
+        assert_test(!req.valid && req.is_error(), "Bare LF in header value returns Error");
+        assert_test(req.error_message == "Bare CR or LF in request", "Bare LF in header error message matches");
+    }
+
+    // Test 52: Bare CR in header value -> Error
+    {
+        std::string raw = "GET / HTTP/1.1\r\nHost: example.com\r\nX-Header: val\rue\r\n\r\n";
+        HttpRequest req = HttpParser::parse(raw);
+        assert_test(!req.valid && req.is_error(), "Bare CR in header value returns Error");
+        assert_test(req.error_message == "Bare CR or LF in request", "Bare CR in header error message matches");
+    }
+
+    // Test 53: Bare LF in request path -> Error
+    {
+        std::string raw = "GET /path\nwithlf HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        HttpRequest req = HttpParser::parse(raw);
+        assert_test(!req.valid && req.is_error(), "Bare LF in request path returns Error");
+        assert_test(req.error_message == "Bare CR or LF in request", "Bare LF in path error message matches");
+    }
+
+    // Test 54: Empty header name -> Error
+    {
+        std::string raw = "GET / HTTP/1.1\r\nHost: example.com\r\n: value\r\n\r\n";
+        HttpRequest req = HttpParser::parse(raw);
+        assert_test(!req.valid && req.is_error(), "Empty header name returns Error");
+        assert_test(req.error_message == "Invalid header name", "Empty header name error message matches");
+    }
+
+    // Test 55: Embedded-space header name -> Error
+    {
+        std::string raw = "GET / HTTP/1.1\r\nHost: example.com\r\nX Foo: bar\r\n\r\n";
+        HttpRequest req = HttpParser::parse(raw);
+        assert_test(!req.valid && req.is_error(), "Embedded-space header name returns Error");
+        assert_test(req.error_message == "Invalid header name", "Embedded-space header name error message matches");
+    }
+
+    // Test 56: Leading-space header name -> Error
+    {
+        std::string raw = "GET / HTTP/1.1\r\nHost: example.com\r\n Transfer-Encoding: chunked\r\n\r\n";
+        HttpRequest req = HttpParser::parse(raw);
+        assert_test(!req.valid && req.is_error(), "Leading-space header name returns Error");
+        assert_test(req.error_message == "Invalid header name", "Leading-space header name error message matches");
+    }
+
+    // Test 57: Non-ASCII header name -> Error
+    {
+        std::string raw = "GET / HTTP/1.1\r\nHost: example.com\r\nX-\xC3\xBC-Header: value\r\n\r\n";
+        HttpRequest req = HttpParser::parse(raw);
+        assert_test(!req.valid && req.is_error(), "Non-ASCII header name returns Error");
+        assert_test(req.error_message == "Invalid header name", "Non-ASCII header name error message matches");
+    }
+
+    // Test 58: Valid RFC 9110 token header name is accepted
+    {
+        std::string raw = "GET / HTTP/1.1\r\nHost: example.com\r\nCustom_Header!#$%&'*+-.^_`|~: test\r\n\r\n";
+        HttpRequest req = HttpParser::parse(raw);
+        assert_test(req.valid && req.is_complete(), "Valid RFC 9110 token header name is accepted");
+    }
+
     std::cout << "\nTest Results: " << g_passed << " passed, " << g_failed << " failed." << std::endl;
     return g_failed == 0 ? 0 : 1;
 }

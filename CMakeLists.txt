@@ -13,6 +13,7 @@ add_executable(secure_proxy_gateway
     src/http_parser.cpp
     src/thread_pool.cpp
     src/authenticator.cpp
+    src/http_forwarder.cpp
 )
 target_include_directories(secure_proxy_gateway PRIVATE include)
 target_compile_options(secure_proxy_gateway PRIVATE -Wall -Wextra -Wpedantic)
@@ -45,3 +46,14 @@ add_executable(test_authenticator
 target_include_directories(test_authenticator PRIVATE include)
 target_compile_options(test_authenticator PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME AuthenticatorTest COMMAND test_authenticator)
+
+add_executable(test_http_forwarder
+    tests/test_http_forwarder.cpp
+    src/http_forwarder.cpp
+    src/http_parser.cpp
+    src/authenticator.cpp
+)
+target_include_directories(test_http_forwarder PRIVATE include)
+target_compile_options(test_http_forwarder PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(test_http_forwarder PRIVATE Threads::Threads)
+add_test(NAME HttpForwarderTest COMMAND test_http_forwarder)

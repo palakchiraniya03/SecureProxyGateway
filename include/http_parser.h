@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <optional>
+#include <vector>
+#include <utility>
 
 enum class ParseStatus {
     Success,
@@ -27,6 +29,7 @@ struct HttpRequest {
     size_t header_length{0}; // Byte offset where the header block ends
     bool valid{false};
     std::string error_message;
+    std::vector<std::pair<std::string, std::string>> headers;
 
     bool is_complete() const { return status == ParseStatus::Success; }
     bool is_incomplete() const { return status == ParseStatus::Incomplete; }

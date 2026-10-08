@@ -17,6 +17,7 @@
 #include "http_parser.h"
 #include "thread_pool.h"
 #include "authenticator.h"
+#include "http_forwarder.h"
 
 /*
  * Socket Lifecycle:
@@ -38,12 +39,15 @@ void handle_signal(int /*signum*/) {
 }
 
 void process_client(int client_fd, const std::string& client_ip, uint16_t client_port) {
-    // Set 5-second socket receive timeout
+    // Set 5-second socket receive and send timeouts
     struct timeval tv{};
     tv.tv_sec = 5;
     tv.tv_usec = 0;
     if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         perror("setsockopt SO_RCVTIMEO failed");
+    }
+    if (setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt SO_SNDTIMEO failed");
     }
 
     {
@@ -213,12 +217,29 @@ void process_client(int client_fd, const std::string& client_ip, uint16_t client
         std::cout << "Authentication successful for client " << client_ip << ":" << client_port << std::endl;
     }
 
-    // Send response to authenticated client
-    const char response[] = "Hello from SecureProxyGateway TCP server!\n";
-    ssize_t bytes_sent = send(client_fd, response, sizeof(response) - 1, 0);
-    if (bytes_sent < 0) {
-        perror("send failed");
+    if (req.method == "CONNECT") {
+        std::string resp_501 = "HTTP/1.1 501 Not Implemented\r\n"
+                               "Content-Type: text/plain\r\n"
+                               "Content-Length: 16\r\n"
+                               "Connection: close\r\n"
+                               "\r\n"
+                               "Not Implemented\n";
+        send(client_fd, resp_501.data(), resp_501.size(), 0);
+        close(client_fd);
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::cout << "Closed client connection." << std::endl;
+        }
+        return;
     }
+
+    // Forward plain HTTP request
+    std::string initial_body = (request_buffer.size() > req.header_length)
+        ? request_buffer.substr(req.header_length)
+        : "";
+
+    HttpForwarder forwarder;
+    forwarder.forward(req, initial_body, client_fd);
 
     // Close client connection
     close(client_fd);

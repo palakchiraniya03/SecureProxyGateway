@@ -165,6 +165,21 @@ bool parse_authority(std::string_view authority, std::string& out_host, std::opt
     return true;
 }
 
+bool is_token(std::string_view s) {
+    if (s.empty()) return false;
+
+    constexpr std::string_view special = "!#$%&'*+-.^_`|~";
+
+    for (unsigned char c : s) {
+        if (!std::isalnum(c) &&
+            special.find(static_cast<char>(c)) == std::string_view::npos) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 HttpRequest HttpParser::parse(std::string_view raw_request) {
@@ -216,6 +231,14 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
         }
         lines.push_back(header_block.substr(start, end - start));
         start = end + 2;
+    }
+
+    for (std::string_view line : lines) {
+        if (line.find_first_of("\r\n") != std::string_view::npos) {
+            req.status = ParseStatus::Error;
+            req.error_message = "Bare CR or LF in request";
+            return req;
+        }
     }
 
     if (lines.empty()) {
@@ -314,7 +337,14 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
             return req;
         }
 
+        if (!is_token(header_name)) {
+            req.status = ParseStatus::Error;
+            req.error_message = "Invalid header name";
+            return req;
+        }
+
         std::string_view header_value = trim_whitespace(line.substr(colon_pos + 1));
+        req.headers.emplace_back(std::string(header_name), std::string(header_value));
 
         if (iequals(header_name, "Host")) {
             if (host_seen) {
