@@ -413,3 +413,20 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
     req.valid = true;
     return req;
 }
+
+std::string HttpParser::make_400_response() {
+    const std::string body = "Bad Request\n";
+    return "HTTP/1.1 400 Bad Request\r\n"
+           "Content-Type: text/plain\r\n"
+           "Content-Length: " + std::to_string(body.size()) + "\r\n"
+           "Connection: close\r\n"
+           "\r\n" + body;
+}
+
+std::string HttpParser::sanitize_path(std::string_view path) {
+    size_t q_pos = path.find('?');
+    if (q_pos != std::string_view::npos) {
+        return std::string(path.substr(0, q_pos));
+    }
+    return std::string(path);
+}

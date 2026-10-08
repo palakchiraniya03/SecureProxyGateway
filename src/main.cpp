@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include "http_parser.h"
 #include "thread_pool.h"
+#include "authenticator.h"
 
 /*
  * Socket Lifecycle:
@@ -47,22 +48,64 @@ void process_client(int client_fd, const std::string& client_ip, uint16_t client
         std::lock_guard<std::mutex> lock(g_log_mutex);
         std::cout << "Client disconnected without sending data." << std::endl;
     } else {
-        {
-            std::lock_guard<std::mutex> lock(g_log_mutex);
-            std::cout << "Received " << bytes_received << " bytes: " << buffer << std::endl;
-        }
-
         // Attempt to parse received data as an HTTP request
         HttpRequest req = HttpParser::parse(std::string_view(buffer, static_cast<size_t>(bytes_received)));
-        if (req.valid) {
+        if (!req.valid) {
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Invalid HTTP request from client " << client_ip << ":" << client_port
+                          << " - sending 400 Bad Request" << std::endl;
+            }
+            std::string resp_400 = HttpParser::make_400_response();
+            ssize_t sent = send(client_fd, resp_400.data(), resp_400.size(), 0);
+            if (sent < 0) {
+                perror("send failed");
+            }
+            close(client_fd);
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Closed client connection." << std::endl;
+            }
+            return;
+        }
+
+        // Safe logging of request metadata with query parameters stripped from path
+        {
+            std::string safe_path = HttpParser::sanitize_path(req.path);
             std::lock_guard<std::mutex> lock(g_log_mutex);
             std::cout << "Parsed HTTP Request: method=" << req.method
                       << " host=" << req.host
                       << " port=" << req.port
-                      << " path=" << req.path << std::endl;
+                      << " path=" << safe_path << std::endl;
         }
 
-        // 6. Send response to client
+        // Authenticate client request
+        Authenticator auth;
+        if (!auth.authenticate(req.proxy_authorization)) {
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Authentication failed for client " << client_ip << ":" << client_port
+                          << " - sending 407 Proxy Authentication Required" << std::endl;
+            }
+            std::string resp_407 = Authenticator::make_407_response();
+            ssize_t sent = send(client_fd, resp_407.data(), resp_407.size(), 0);
+            if (sent < 0) {
+                perror("send failed");
+            }
+            close(client_fd);
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Closed client connection." << std::endl;
+            }
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::cout << "Authentication successful for client " << client_ip << ":" << client_port << std::endl;
+        }
+
+        // 6. Send response to authenticated client
         const char response[] = "Hello from SecureProxyGateway TCP server!\n";
         ssize_t bytes_sent = send(client_fd, response, sizeof(response) - 1, 0);
         if (bytes_sent < 0) {

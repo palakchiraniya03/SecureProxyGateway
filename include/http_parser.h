@@ -38,6 +38,8 @@ public:
     static constexpr size_t MAX_HEADER_BLOCK_SIZE = 8192; // 8 KB
 
     static HttpRequest parse(std::string_view raw_request);
+    static std::string make_400_response();
+    static std::string sanitize_path(std::string_view path);
 };
 
 #endif // HTTP_PARSER_H

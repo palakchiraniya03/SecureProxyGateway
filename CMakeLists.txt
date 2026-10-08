@@ -12,6 +12,7 @@ add_executable(secure_proxy_gateway
     src/main.cpp
     src/http_parser.cpp
     src/thread_pool.cpp
+    src/authenticator.cpp
 )
 target_include_directories(secure_proxy_gateway PRIVATE include)
 target_compile_options(secure_proxy_gateway PRIVATE -Wall -Wextra -Wpedantic)
@@ -36,3 +37,11 @@ target_include_directories(test_thread_pool PRIVATE include)
 target_compile_options(test_thread_pool PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(test_thread_pool PRIVATE Threads::Threads)
 add_test(NAME ThreadPoolTest COMMAND test_thread_pool)
+
+add_executable(test_authenticator
+    tests/test_authenticator.cpp
+    src/authenticator.cpp
+)
+target_include_directories(test_authenticator PRIVATE include)
+target_compile_options(test_authenticator PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME AuthenticatorTest COMMAND test_authenticator)

@@ -366,6 +366,43 @@ int main() {
         assert_test(req.port == 8080, "Port preserved as 8080");
     }
 
+    // Test 33: 400 Bad Request response structure and exact Content-Length match
+    {
+        std::string resp = HttpParser::make_400_response();
+        assert_test(resp.find("HTTP/1.1 400 Bad Request") != std::string::npos,
+                    "400 response contains status line");
+        assert_test(resp.find("Connection: close") != std::string::npos,
+                    "400 response contains Connection: close");
+
+        size_t header_sep = resp.find("\r\n\r\n");
+        assert_test(header_sep != std::string::npos, "400 response contains header separator");
+
+        std::string body = resp.substr(header_sep + 4);
+        std::string cl_needle = "Content-Length: ";
+        size_t cl_pos = resp.find(cl_needle);
+        assert_test(cl_pos != std::string::npos, "400 response contains Content-Length header");
+
+        size_t cl_end = resp.find("\r\n", cl_pos);
+        std::string cl_str = resp.substr(cl_pos + cl_needle.size(), cl_end - (cl_pos + cl_needle.size()));
+        size_t cl_val = std::stoul(cl_str);
+
+        assert_test(cl_val == body.size(),
+                    "400 Content-Length exactly matches body size",
+                    "Expected: " + std::to_string(body.size()) + ", Got: " + std::to_string(cl_val));
+    }
+
+    // Test 34: Path sanitization strips query parameters
+    {
+        assert_test(HttpParser::sanitize_path("/page?token=secret123") == "/page",
+                    "sanitize_path strips query token from /page?token=secret123");
+        assert_test(HttpParser::sanitize_path("/api/search?q=test&page=2") == "/api/search",
+                    "sanitize_path strips complex query from /api/search");
+        assert_test(HttpParser::sanitize_path("/index.html") == "/index.html",
+                    "sanitize_path preserves path without query");
+        assert_test(HttpParser::sanitize_path("") == "",
+                    "sanitize_path handles empty path");
+    }
+
     std::cout << "\nTest Results: " << g_passed << " passed, " << g_failed << " failed." << std::endl;
     return g_failed == 0 ? 0 : 1;
 }
