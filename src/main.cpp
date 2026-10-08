@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "http_parser.h"
 
 /*
  * Socket Lifecycle:
@@ -111,6 +112,15 @@ int main() {
             std::cout << "Client disconnected without sending data." << std::endl;
         } else {
             std::cout << "Received " << bytes_received << " bytes: " << buffer << std::endl;
+
+            // Attempt to parse received data as an HTTP request
+            HttpRequest req = HttpParser::parse(std::string_view(buffer, static_cast<size_t>(bytes_received)));
+            if (req.valid) {
+                std::cout << "Parsed HTTP Request: method=" << req.method
+                          << " host=" << req.host
+                          << " port=" << req.port
+                          << " path=" << req.path << std::endl;
+            }
 
             // 6. Send response to client
             const char response[] = "Hello from SecureProxyGateway TCP server!\n";
