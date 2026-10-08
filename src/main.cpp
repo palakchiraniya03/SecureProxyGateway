@@ -3,10 +3,15 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdint>
+#include <cerrno>
+#include <chrono>
+#include <algorithm>
 #include <mutex>
+#include <poll.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "http_parser.h"
@@ -19,7 +24,7 @@
  * 2. bind()    - Bind the socket to a local address (127.0.0.1) and port (8080).
  * 3. listen()  - Mark the socket as passive, ready to accept incoming connections.
  * 4. accept()  - Extract the first connection request on the queue and create a new connected socket.
- * 5. recv()    - Receive data from the connected client socket (handled by worker thread).
+ * 5. recv()    - Receive data from client in a read loop until headers are complete or timeout.
  * 6. send()    - Send response data back to the client socket (handled by worker thread).
  * 7. close()   - Close the client connection and listening server socket when done.
  */
@@ -33,33 +38,92 @@ void handle_signal(int /*signum*/) {
 }
 
 void process_client(int client_fd, const std::string& client_ip, uint16_t client_port) {
+    // Set 5-second socket receive timeout
+    struct timeval tv{};
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt SO_RCVTIMEO failed");
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_log_mutex);
         std::cout << "Accepted connection from " << client_ip << ":" << client_port << std::endl;
     }
 
-    // 5. Receive data from client
-    char buffer[1024];
-    std::memset(buffer, 0, sizeof(buffer));
-    ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_received < 0) {
-        perror("recv failed");
-    } else if (bytes_received == 0) {
-        std::lock_guard<std::mutex> lock(g_log_mutex);
-        std::cout << "Client disconnected without sending data." << std::endl;
-    } else {
-        // Attempt to parse received data as an HTTP request
-        HttpRequest req = HttpParser::parse(std::string_view(buffer, static_cast<size_t>(bytes_received)));
-        if (!req.valid) {
+    std::string request_buffer;
+    request_buffer.reserve(HttpParser::MAX_HEADER_BLOCK_SIZE);
+
+    char chunk[1024];
+    HttpRequest req;
+
+    // Total 10-second header read deadline
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+
+    // HTTP Read Loop: continue reading until complete, error, or 8 KB limit reached
+    while (request_buffer.size() < HttpParser::MAX_HEADER_BLOCK_SIZE) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
             {
                 std::lock_guard<std::mutex> lock(g_log_mutex);
-                std::cout << "Invalid HTTP request from client " << client_ip << ":" << client_port
-                          << " - sending 400 Bad Request" << std::endl;
+                std::cout << "Client " << client_ip << ":" << client_port << " header-read timeout." << std::endl;
+                std::cout << "Closed client connection." << std::endl;
             }
-            std::string resp_400 = HttpParser::make_400_response();
-            ssize_t sent = send(client_fd, resp_400.data(), resp_400.size(), 0);
-            if (sent < 0) {
-                perror("send failed");
+            close(client_fd);
+            return;
+        }
+
+        auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        if (remaining_ms <= 0) {
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Client " << client_ip << ":" << client_port << " header-read timeout." << std::endl;
+                std::cout << "Closed client connection." << std::endl;
+            }
+            close(client_fd);
+            return;
+        }
+
+        struct pollfd pfd{};
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
+
+        int poll_res = poll(&pfd, 1, static_cast<int>(remaining_ms));
+        if (poll_res == 0) {
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Client " << client_ip << ":" << client_port << " header-read timeout." << std::endl;
+                std::cout << "Closed client connection." << std::endl;
+            }
+            close(client_fd);
+            return;
+        }
+        if (poll_res < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll failed");
+            close(client_fd);
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Closed client connection." << std::endl;
+            }
+            return;
+        }
+
+        size_t space_left = HttpParser::MAX_HEADER_BLOCK_SIZE - request_buffer.size();
+        size_t to_read = std::min(sizeof(chunk), space_left);
+
+        ssize_t bytes_read = recv(client_fd, chunk, to_read, 0);
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Client " << client_ip << ":" << client_port << " timed out waiting for request." << std::endl;
+            } else {
+                perror("recv failed");
             }
             close(client_fd);
             {
@@ -69,29 +133,8 @@ void process_client(int client_fd, const std::string& client_ip, uint16_t client
             return;
         }
 
-        // Safe logging of request metadata with query parameters stripped from path
-        {
-            std::string safe_path = HttpParser::sanitize_path(req.path);
-            std::lock_guard<std::mutex> lock(g_log_mutex);
-            std::cout << "Parsed HTTP Request: method=" << req.method
-                      << " host=" << req.host
-                      << " port=" << req.port
-                      << " path=" << safe_path << std::endl;
-        }
-
-        // Authenticate client request
-        Authenticator auth;
-        if (!auth.authenticate(req.proxy_authorization)) {
-            {
-                std::lock_guard<std::mutex> lock(g_log_mutex);
-                std::cout << "Authentication failed for client " << client_ip << ":" << client_port
-                          << " - sending 407 Proxy Authentication Required" << std::endl;
-            }
-            std::string resp_407 = Authenticator::make_407_response();
-            ssize_t sent = send(client_fd, resp_407.data(), resp_407.size(), 0);
-            if (sent < 0) {
-                perror("send failed");
-            }
+        if (bytes_read == 0) {
+            // Client closed connection without completing request
             close(client_fd);
             {
                 std::lock_guard<std::mutex> lock(g_log_mutex);
@@ -100,20 +143,84 @@ void process_client(int client_fd, const std::string& client_ip, uint16_t client
             return;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(g_log_mutex);
-            std::cout << "Authentication successful for client " << client_ip << ":" << client_port << std::endl;
-        }
+        request_buffer.append(chunk, static_cast<size_t>(bytes_read));
 
-        // 6. Send response to authenticated client
-        const char response[] = "Hello from SecureProxyGateway TCP server!\n";
-        ssize_t bytes_sent = send(client_fd, response, sizeof(response) - 1, 0);
-        if (bytes_sent < 0) {
-            perror("send failed");
+        req = HttpParser::parse(request_buffer);
+        if (!req.is_incomplete()) {
+            break;
         }
     }
 
-    // 7. Close client connection
+    // If buffer reached 8 KB limit without receiving header terminator, treat as error
+    if (req.is_incomplete()) {
+        req.status = ParseStatus::Error;
+        req.valid = false;
+        req.error_message = "Header block exceeds maximum size of 8 KB";
+    }
+
+    if (!req.valid) {
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::cout << "Invalid HTTP request from client " << client_ip << ":" << client_port
+                      << " - sending 400 Bad Request" << std::endl;
+        }
+        std::string resp_400 = HttpParser::make_400_response();
+        ssize_t sent = send(client_fd, resp_400.data(), resp_400.size(), 0);
+        if (sent < 0) {
+            perror("send failed");
+        }
+        close(client_fd);
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::cout << "Closed client connection." << std::endl;
+        }
+        return;
+    }
+
+    // Safe logging of request metadata with query parameters stripped from path
+    {
+        std::string safe_path = HttpParser::sanitize_path(req.path);
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        std::cout << "Parsed HTTP Request: method=" << req.method
+                  << " host=" << req.host
+                  << " port=" << req.port
+                  << " path=" << safe_path << std::endl;
+    }
+
+    // Authenticate client request
+    Authenticator auth;
+    if (!auth.authenticate(req.proxy_authorization)) {
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::cout << "Authentication failed for client " << client_ip << ":" << client_port
+                      << " - sending 407 Proxy Authentication Required" << std::endl;
+        }
+        std::string resp_407 = Authenticator::make_407_response();
+        ssize_t sent = send(client_fd, resp_407.data(), resp_407.size(), 0);
+        if (sent < 0) {
+            perror("send failed");
+        }
+        close(client_fd);
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::cout << "Closed client connection." << std::endl;
+        }
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        std::cout << "Authentication successful for client " << client_ip << ":" << client_port << std::endl;
+    }
+
+    // Send response to authenticated client
+    const char response[] = "Hello from SecureProxyGateway TCP server!\n";
+    ssize_t bytes_sent = send(client_fd, response, sizeof(response) - 1, 0);
+    if (bytes_sent < 0) {
+        perror("send failed");
+    }
+
+    // Close client connection
     close(client_fd);
     {
         std::lock_guard<std::mutex> lock(g_log_mutex);

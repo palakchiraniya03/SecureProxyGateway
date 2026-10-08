@@ -3,6 +3,7 @@
 #include <cctype>
 #include <optional>
 #include <vector>
+#include <arpa/inet.h>
 
 namespace {
 
@@ -59,6 +60,19 @@ bool parse_port(std::string_view port_str, uint16_t& out_port) {
     return true;
 }
 
+bool is_valid_hostname_char(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) ||
+           c == '.' || c == '-' || c == '_';
+}
+
+std::string normalize_hostname(std::string_view h) {
+    std::string s = to_lower_str(h);
+    while (!s.empty() && s.back() == '.') {
+        s.pop_back();
+    }
+    return s;
+}
+
 // Parses host and optional port from an authority string (e.g. "example.com:8080", "example.com", "[::1]:8080")
 bool parse_authority(std::string_view authority, std::string& out_host, std::optional<uint16_t>& out_port, std::string& error_msg) {
     if (authority.empty()) {
@@ -72,7 +86,21 @@ bool parse_authority(std::string_view authority, std::string& out_host, std::opt
             error_msg = "Malformed IPv6 address (missing closing bracket)";
             return false;
         }
-        out_host = std::string(authority.substr(1, closing - 1));
+        std::string_view raw_ipv6 = authority.substr(1, closing - 1);
+        if (raw_ipv6.empty()) {
+            error_msg = "IPv6 literal cannot be empty";
+            return false;
+        }
+
+        std::string ipv6_str(raw_ipv6);
+        struct in6_addr addr6{};
+        if (inet_pton(AF_INET6, ipv6_str.c_str(), &addr6) != 1) {
+            error_msg = "Invalid IPv6 address literal: " + ipv6_str;
+            return false;
+        }
+
+        out_host = to_lower_str(raw_ipv6);
+
         std::string_view remainder = authority.substr(closing + 1);
         if (remainder.empty()) {
             out_port = std::nullopt;
@@ -92,27 +120,48 @@ bool parse_authority(std::string_view authority, std::string& out_host, std::opt
         return false;
     }
 
+    std::string_view host_part;
+    std::optional<uint16_t> port_val;
+
     size_t colon_pos = authority.find(':');
     if (colon_pos != std::string_view::npos) {
-        std::string_view host_part = authority.substr(0, colon_pos);
+        host_part = authority.substr(0, colon_pos);
         std::string_view port_str = authority.substr(colon_pos + 1);
 
         if (host_part.empty()) {
             error_msg = "Host part cannot be empty in authority";
             return false;
         }
-        uint16_t port_val = 0;
-        if (!parse_port(port_str, port_val)) {
+        uint16_t p = 0;
+        if (!parse_port(port_str, p)) {
             error_msg = "Invalid port in authority: " + std::string(port_str);
             return false;
         }
-        out_host = std::string(host_part);
-        out_port = port_val;
-        return true;
+        port_val = p;
+    } else {
+        host_part = authority;
     }
 
-    out_host = std::string(authority);
-    out_port = std::nullopt;
+    if (host_part.empty()) {
+        error_msg = "Host part cannot be empty";
+        return false;
+    }
+
+    for (char c : host_part) {
+        if (!is_valid_hostname_char(c)) {
+            error_msg = "Invalid character in host: '" + std::string(1, c) + "'";
+            return false;
+        }
+    }
+
+    std::string norm = normalize_hostname(host_part);
+    if (norm.empty()) {
+        error_msg = "Host cannot be empty after stripping trailing dot";
+        return false;
+    }
+
+    out_host = norm;
+    out_port = port_val;
     return true;
 }
 
@@ -123,17 +172,8 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
     req.status = ParseStatus::Incomplete;
     req.valid = false;
 
-    // Locate end of headers
-    size_t terminator_len = 4;
+    // Unambiguous CRLF-based header termination
     size_t header_end_pos = raw_request.find("\r\n\r\n");
-    if (header_end_pos == std::string_view::npos) {
-        size_t lf_pos = raw_request.find("\n\n");
-        if (lf_pos != std::string_view::npos) {
-            header_end_pos = lf_pos;
-            terminator_len = 2;
-        }
-    }
-
     if (header_end_pos == std::string_view::npos) {
         if (raw_request.size() > MAX_HEADER_BLOCK_SIZE) {
             req.status = ParseStatus::Error;
@@ -145,6 +185,7 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
         return req;
     }
 
+    constexpr size_t terminator_len = 4;
     if (header_end_pos + terminator_len > MAX_HEADER_BLOCK_SIZE) {
         req.status = ParseStatus::Error;
         req.error_message = "Header block exceeds maximum size of 8 KB";
@@ -154,26 +195,27 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
     req.header_length = header_end_pos + terminator_len;
     std::string_view header_block = raw_request.substr(0, header_end_pos);
 
-    // Split header block into lines
+    // Reject control characters (< 0x20 except CR, LF, HTAB, and reject DEL 0x7F)
+    for (char c : header_block) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if ((uc < 0x20 && uc != '\r' && uc != '\n' && uc != '\t') || uc == 0x7F) {
+            req.status = ParseStatus::Error;
+            req.error_message = "Invalid control character in request";
+            return req;
+        }
+    }
+
+    // Split header block into lines delimited by CRLF
     std::vector<std::string_view> lines;
     size_t start = 0;
     while (start < header_block.size()) {
-        size_t end = header_block.find('\n', start);
+        size_t end = header_block.find("\r\n", start);
         if (end == std::string_view::npos) {
-            std::string_view line = header_block.substr(start);
-            if (!line.empty() && line.back() == '\r') {
-                line.remove_suffix(1);
-            }
-            lines.push_back(line);
+            lines.push_back(header_block.substr(start));
             break;
         }
-
-        std::string_view line = header_block.substr(start, end - start);
-        if (!line.empty() && line.back() == '\r') {
-            line.remove_suffix(1);
-        }
-        lines.push_back(line);
-        start = end + 1;
+        lines.push_back(header_block.substr(start, end - start));
+        start = end + 2;
     }
 
     if (lines.empty()) {
@@ -187,6 +229,15 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
         req.status = ParseStatus::Error;
         req.error_message = "Empty request line";
         return req;
+    }
+
+    // Disallow tabs in request line
+    for (char c : request_line) {
+        if (c == '\t') {
+            req.status = ParseStatus::Error;
+            req.error_message = "Tab not allowed in request line";
+            return req;
+        }
     }
 
     // Split request line by space
@@ -232,17 +283,21 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
         return req;
     }
 
-    if (req.version.rfind("HTTP/", 0) != 0 || req.version.size() <= 5) {
+    // Accept only HTTP/1.0 and HTTP/1.1
+    if (req.version != "HTTP/1.0" && req.version != "HTTP/1.1") {
         req.status = ParseStatus::Error;
-        req.error_message = "Malformed or unsupported HTTP version: " + req.version;
+        req.error_message = "Unsupported or invalid HTTP version: " + req.version;
         return req;
     }
 
-    // Parse header fields
+    // Parse header fields; an empty line inside header block marks the end of headers
+    bool host_seen = false;
+    bool content_length_seen = false;
+
     for (size_t i = 1; i < lines.size(); ++i) {
         std::string_view line = lines[i];
         if (line.empty()) {
-            continue;
+            break;
         }
 
         size_t colon_pos = line.find(':');
@@ -262,10 +317,27 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
         std::string_view header_value = trim_whitespace(line.substr(colon_pos + 1));
 
         if (iequals(header_name, "Host")) {
+            if (host_seen) {
+                req.status = ParseStatus::Error;
+                req.error_message = "Duplicate Host header";
+                return req;
+            }
+            host_seen = true;
             req.host_header = std::string(header_value);
+        } else if (iequals(header_name, "Transfer-Encoding")) {
+            req.status = ParseStatus::Error;
+            req.error_message = "Transfer-Encoding header is not supported";
+            return req;
         } else if (iequals(header_name, "Proxy-Authorization")) {
             req.proxy_authorization = std::string(header_value);
         } else if (iequals(header_name, "Content-Length")) {
+            if (content_length_seen) {
+                req.status = ParseStatus::Error;
+                req.error_message = "Duplicate Content-Length header";
+                return req;
+            }
+            content_length_seen = true;
+
             if (header_value.empty()) {
                 req.status = ParseStatus::Error;
                 req.error_message = "Content-Length header cannot be empty";
@@ -310,7 +382,7 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
             return req;
         }
 
-        req.host = to_lower_str(connect_host);
+        req.host = connect_host;
         req.port = *connect_port;
         req.path = "";
         req.status = ParseStatus::Success;
@@ -378,18 +450,18 @@ HttpRequest HttpParser::parse(std::string_view raw_request) {
         }
     }
 
-    // Determine final host and port
+    // Determine final host and port:
+    // When an absolute URI is present, it determines the destination completely.
+    // The Host header must not override the destination or port.
     if (!target_host.empty()) {
-        req.host = to_lower_str(target_host);
+        req.host = target_host;
         if (target_port.has_value()) {
             req.port = *target_port;
-        } else if (header_port.has_value()) {
-            req.port = *header_port;
         } else {
             req.port = default_scheme_port;
         }
     } else if (!header_host.empty()) {
-        req.host = to_lower_str(header_host);
+        req.host = header_host;
         if (header_port.has_value()) {
             req.port = *header_port;
         } else {
