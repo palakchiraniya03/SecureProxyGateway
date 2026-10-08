@@ -3,12 +3,14 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdint>
+#include <mutex>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "http_parser.h"
+#include "thread_pool.h"
 
 /*
  * Socket Lifecycle:
@@ -16,18 +18,67 @@
  * 2. bind()    - Bind the socket to a local address (127.0.0.1) and port (8080).
  * 3. listen()  - Mark the socket as passive, ready to accept incoming connections.
  * 4. accept()  - Extract the first connection request on the queue and create a new connected socket.
- * 5. recv()    - Receive data from the connected client socket.
- * 6. send()    - Send response data back to the client socket.
+ * 5. recv()    - Receive data from the connected client socket (handled by worker thread).
+ * 6. send()    - Send response data back to the client socket (handled by worker thread).
  * 7. close()   - Close the client connection and listening server socket when done.
  */
 
 namespace {
 volatile sig_atomic_t g_running = 1;
+std::mutex g_log_mutex;
 
 void handle_signal(int /*signum*/) {
     g_running = 0;
 }
+
+void process_client(int client_fd, const std::string& client_ip, uint16_t client_port) {
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        std::cout << "Accepted connection from " << client_ip << ":" << client_port << std::endl;
+    }
+
+    // 5. Receive data from client
+    char buffer[1024];
+    std::memset(buffer, 0, sizeof(buffer));
+    ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (bytes_received < 0) {
+        perror("recv failed");
+    } else if (bytes_received == 0) {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        std::cout << "Client disconnected without sending data." << std::endl;
+    } else {
+        {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::cout << "Received " << bytes_received << " bytes: " << buffer << std::endl;
+        }
+
+        // Attempt to parse received data as an HTTP request
+        HttpRequest req = HttpParser::parse(std::string_view(buffer, static_cast<size_t>(bytes_received)));
+        if (req.valid) {
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::cout << "Parsed HTTP Request: method=" << req.method
+                      << " host=" << req.host
+                      << " port=" << req.port
+                      << " path=" << req.path << std::endl;
+        }
+
+        // 6. Send response to client
+        const char response[] = "Hello from SecureProxyGateway TCP server!\n";
+        ssize_t bytes_sent = send(client_fd, response, sizeof(response) - 1, 0);
+        if (bytes_sent < 0) {
+            perror("send failed");
+        }
+    }
+
+    // 7. Close client connection
+    close(client_fd);
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        std::cout << "Closed client connection." << std::endl;
+    }
 }
+
+} // namespace
 
 int main() {
     std::cout << "Secure Proxy Gateway starting..." << std::endl;
@@ -82,6 +133,9 @@ int main() {
         return 1;
     }
 
+    // Initialize thread pool with 4 worker threads
+    ThreadPool pool(4);
+    std::cout << "Thread pool started with 4 worker threads." << std::endl;
     std::cout << "Server listening on " << server_ip << ":" << server_port << "..." << std::endl;
 
     while (g_running) {
@@ -100,42 +154,17 @@ int main() {
 
         char client_ip_buf[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_buf, sizeof(client_ip_buf));
-        std::cout << "Accepted connection from " << client_ip_buf << ":" << ntohs(client_addr.sin_port) << std::endl;
+        std::string client_ip(client_ip_buf);
+        uint16_t client_port = ntohs(client_addr.sin_port);
 
-        // 5. Receive data from client
-        char buffer[1024];
-        std::memset(buffer, 0, sizeof(buffer));
-        ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-        if (bytes_received < 0) {
-            perror("recv failed");
-        } else if (bytes_received == 0) {
-            std::cout << "Client disconnected without sending data." << std::endl;
-        } else {
-            std::cout << "Received " << bytes_received << " bytes: " << buffer << std::endl;
-
-            // Attempt to parse received data as an HTTP request
-            HttpRequest req = HttpParser::parse(std::string_view(buffer, static_cast<size_t>(bytes_received)));
-            if (req.valid) {
-                std::cout << "Parsed HTTP Request: method=" << req.method
-                          << " host=" << req.host
-                          << " port=" << req.port
-                          << " path=" << req.path << std::endl;
-            }
-
-            // 6. Send response to client
-            const char response[] = "Hello from SecureProxyGateway TCP server!\n";
-            ssize_t bytes_sent = send(client_fd, response, sizeof(response) - 1, 0);
-            if (bytes_sent < 0) {
-                perror("send failed");
-            }
-        }
-
-        // 7. Close client connection
-        close(client_fd);
-        std::cout << "Closed client connection." << std::endl;
+        // Enqueue client request handling task to the thread pool
+        pool.enqueue([client_fd, client_ip, client_port]() {
+            process_client(client_fd, client_ip, client_port);
+        });
     }
 
     std::cout << "Shutting down server..." << std::endl;
     close(server_fd);
+    pool.stop();
     return 0;
 }
