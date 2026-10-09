@@ -34,6 +34,14 @@ namespace {
 volatile sig_atomic_t g_running = 1;
 std::mutex g_log_mutex;
 
+bool is_loopback_allowed_for_testing() {
+    static const bool allowed = []() {
+        const char* env = std::getenv("SECURE_PROXY_ALLOW_LOOPBACK");
+        return env != nullptr && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
+    }();
+    return allowed;
+}
+
 void handle_signal(int /*signum*/) {
     g_running = 0;
 }
@@ -237,7 +245,7 @@ void process_client(int client_fd, const std::string& client_ip, uint16_t client
             ? request_buffer.substr(req.header_length)
             : "";
 
-        HttpForwarder forwarder;
+        HttpForwarder forwarder(is_loopback_allowed_for_testing());
         forwarder.forward_connect(req, initial_data, client_fd);
 
         close(client_fd);
@@ -253,7 +261,7 @@ void process_client(int client_fd, const std::string& client_ip, uint16_t client
         ? request_buffer.substr(req.header_length)
         : "";
 
-    HttpForwarder forwarder;
+    HttpForwarder forwarder(is_loopback_allowed_for_testing());
     forwarder.forward(req, initial_body, client_fd);
 
     // Close client connection

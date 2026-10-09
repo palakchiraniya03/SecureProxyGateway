@@ -17,7 +17,7 @@ A high-reliability, security-hardened HTTP/1.1 and HTTPS CONNECT forward proxy g
 - **Defense-in-Depth Security**: Validates all resolved IPv4 and IPv6 addresses against private (RFC 1918), loopback, link-local, carrier-grade NAT (RFC 6598), 6to4, Teredo, and multicast ranges before establishing outbound connections.
 - **Timing-Attack Resistance**: Uses constant-time string comparison for credential verification during proxy authentication.
 - **Poll-Driven Bidirectional Relay**: Employs non-blocking sockets and `poll()` with asymmetric TCP half-close handling (`SHUT_WR` / FIN propagation) and backpressure buffer management.
-- **Zero-Warning Clean Build & CI**: Compiles cleanly with `-Wall -Wextra -Wpedantic` on C++17, verified by a 353-test automated test suite and GitHub Actions CI.
+- **Zero-Warning Clean Build & CI**: Compiles cleanly with `-Wall -Wextra -Wpedantic` on C++17, verified by a 355-test automated test suite and GitHub Actions CI.
 
 ---
 
@@ -226,7 +226,7 @@ curl -i -x http://palak:secureproxy@127.0.0.1:8080 http://127.0.0.1:22/
 
 ## Testing
 
-The project maintains comprehensive test coverage across 5 dedicated test suites comprising 353 test cases.
+The project maintains comprehensive test coverage across 5 dedicated test suites comprising 355 test cases.
 
 ### Running Tests via CTest
 ```bash
@@ -240,7 +240,7 @@ ctest --test-dir build --output-on-failure
 | `HttpParserTest` | `test_http_parser` | 130 | Origin, absolute, and authority request formats; header parsing; strict CRLF validation; path sanitization; 8 KB boundary handling; malformed request rejections. |
 | `ThreadPoolTest` | `test_thread_pool` | 3 | Task dispatch; multi-threaded workload distribution across 32 threads; thread pool shutdown synchronization. |
 | `AuthenticatorTest` | `test_authenticator` | 27 | RFC 7617 Basic auth; Base64 encoding/decoding; constant-time string comparison; credentials with colons; 407 challenge construction. |
-| `HttpForwarderTest` | `test_http_forwarder` | 106 | IPv4/IPv6 SSRF filtering; canonical request rebuilding; hop-by-hop header removal; streaming response forwarding; 10 MB payload limits; timeout deadlines. |
+| `HttpForwarderTest` | `test_http_forwarder` | 108 | IPv4/IPv6 SSRF filtering; canonical request rebuilding; hop-by-hop header removal; streaming response forwarding; 10 MB payload limits; timeout deadlines. |
 | `ConnectTunnelTest` | `test_connect` | 87 | CONNECT authority parsing; port 443/8443 restrictions; SSRF validation; 200 handshake; non-blocking bidirectional relay; TCP half-close handling under backpressure; idle and lifetime timeouts; concurrency limits. |
 
 ### Running Individual Test Binaries
@@ -259,6 +259,54 @@ The repository includes an automated CI workflow configured in [`.github/workflo
 2. Configures a Release build (`-DCMAKE_BUILD_TYPE=Release`).
 3. Compiles the project with `-Wall -Wextra -Wpedantic`.
 4. Executes all 5 test suites through `ctest --output-on-failure`.
+
+---
+
+## Performance and Concurrency Benchmark
+
+The project includes a standalone, reproducible benchmark utility ([`scripts/benchmark.py`](scripts/benchmark.py)) to evaluate gateway throughput, latency percentiles, and error handling across varying concurrent client loads.
+
+### Prerequisites & Configuration
+- **Python**: Python 3.8+ (uses standard library only: `socket`, `http.server`, `threading`, `time`, `csv`; no external dependencies required).
+- **Proxy Build**: The gateway binary must be compiled (`./build/secure_proxy_gateway`).
+- **Loopback Testing Mode**: When benchmarking against local test upstreams on loopback interfaces, set `SECURE_PROXY_ALLOW_LOOPBACK=1` or run the script with `--manage-proxy` (which automatically passes this flag to allow loopback destination testing while maintaining self-connection prevention). **Security Notice**: This setting is strictly for isolated local testing and benchmarking; it must never be enabled in a production environment.
+
+### Running the Benchmark
+
+```bash
+# 1. Standard run (spawns local mock upstream and runs passes across 1, 5, 10, 20 concurrent clients)
+python3 scripts/benchmark.py --manage-proxy
+
+# 2. Custom concurrency and request counts, saving output to CSV:
+python3 scripts/benchmark.py --manage-proxy --concurrency 1,5,10,20 --requests 100 --csv build/benchmark_results.csv
+
+# 3. Running against an already running proxy instance:
+python3 scripts/benchmark.py --proxy-host 127.0.0.1 --proxy-port 8080 --requests 100
+
+# 4. Validating failure scenarios (unreachable proxy, down upstream, invalid auth):
+python3 scripts/benchmark.py --manage-proxy --test-failures
+```
+
+### Metrics Reported
+- **Concurrency**: Number of concurrent client worker threads.
+- **Total Requests / Success / Failed**: Total processed requests and count of HTTP 200 vs failed requests.
+- **Err %**: Percentage of requests failing due to HTTP errors (e.g., 502, 403, 407) or client timeouts.
+- **Req/s**: Overall throughput (completed requests per second).
+- **Avg Latency (ms)**: Arithmetic mean round-trip request latency.
+- **p50 Latency (ms)**: Median request latency (50th percentile).
+- **p95 Latency (ms)**: Tail latency (95th percentile).
+
+### Interpreting the Results
+- **Concurrency Scaling**: As concurrent client threads increase up to the 32-worker pool limit, aggregate throughput scales while p50 latency remains bounded within low milliseconds under local network conditions.
+- **Tail Latency (p95)**: Under higher concurrent loads (e.g., 20 concurrent connections), tail latencies reflect OS thread scheduling and connection queueing in the fixed worker thread pool.
+- **Error Rates**: A 0.0% error rate confirms that all client requests were successfully authenticated, parsed, and forwarded without connection drops or worker starvation.
+
+### Machine & Environment Context for Reproducibility
+When recording or comparing benchmark numbers, record the host environment specifications:
+- **Operating System & Kernel**: Linux (e.g., `uname -srm`)
+- **CPU & Hardware**: Core count, clock speed, and architecture (e.g., `lscpu`)
+- **Compiler & Standard**: GCC or Clang version with `-O3` / `-DCMAKE_BUILD_TYPE=Release`
+- **Network Interface**: Local loopback (`lo`) vs external network interface
 
 ---
 

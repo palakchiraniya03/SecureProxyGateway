@@ -84,7 +84,7 @@ bool is_ssrf_safe_ipv4(uint32_t ip, uint16_t port, bool allow_loopback) {
     if ((ip >> 24) == 127) {
         if (allow_loopback) {
             // Even when testing loopback, prohibit connecting to gateway's own listening port
-            if (ip == 0x7F000001 && port == 8080) {
+            if (port == 8080) {
                 return false;
             }
             return true;

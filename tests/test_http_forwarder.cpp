@@ -141,6 +141,17 @@ int main() {
         assert_test(!HttpForwarder::is_ssrf_safe(reinterpret_cast<struct sockaddr*>(&sin), len, true),
                     "SSRF rejects gateway listening port 127.0.0.1:8080 even in test mode");
 
+        // 127.0.0.2:8080 rejected even if allow_loopback is true
+        inet_pton(AF_INET, "127.0.0.2", &sin.sin_addr);
+        sin.sin_port = htons(8080);
+        assert_test(!HttpForwarder::is_ssrf_safe(reinterpret_cast<struct sockaddr*>(&sin), len, true),
+                    "SSRF rejects alternate loopback 127.0.0.2 on port 8080 in test mode");
+
+        // 127.0.0.2 on non-8080 port allowed when allow_loopback is true
+        sin.sin_port = htons(9090);
+        assert_test(HttpForwarder::is_ssrf_safe(reinterpret_cast<struct sockaddr*>(&sin), len, true),
+                    "SSRF allows alternate loopback 127.0.0.2 on non-8080 port in test mode");
+
         // 0.0.0.0
         inet_pton(AF_INET, "0.0.0.0", &sin.sin_addr);
         sin.sin_port = htons(80);
