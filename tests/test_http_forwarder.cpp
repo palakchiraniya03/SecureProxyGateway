@@ -37,6 +37,13 @@ void assert_test(bool condition, const std::string& test_name, const std::string
     }
 }
 
+void verify_ok(bool condition, const std::string& msg = "") {
+    if (!condition) {
+        std::cerr << "Test setup failed: " << msg << std::endl;
+        std::abort();
+    }
+}
+
 // Lightweight mock destination server running on loopback with an ephemeral port
 class MockHttpServer {
 public:
@@ -365,8 +372,8 @@ int main() {
     {
         HttpForwarder forwarder(false); // Default strict SSRF protection
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw1 =
             "GET http://127.0.0.1:8080/admin HTTP/1.1\r\n"
@@ -385,7 +392,7 @@ int main() {
                     "Client receives 403 Forbidden response on SSRF block (127.0.0.1)");
 
         // Test localhost
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
         std::string raw2 =
             "GET http://localhost/ HTTP/1.1\r\n"
             "Host: localhost\r\n"
@@ -407,8 +414,8 @@ int main() {
     {
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw =
             "GET http://definitely-nonexistent-domain-xyz12345.invalid/ HTTP/1.1\r\n"
@@ -431,8 +438,8 @@ int main() {
     {
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         // Pick an unused port on 127.0.0.1 where nothing is listening (e.g. port 1)
         std::string raw =
@@ -474,8 +481,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true); // allow loopback for test destination
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw =
             "GET http://127.0.0.1:" + std::to_string(srv_port) + "/api/resource?query=1 HTTP/1.1\r\n"
@@ -558,8 +565,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw =
             "GET http://127.0.0.1:" + std::to_string(srv_port) + "/large HTTP/1.1\r\n"
@@ -586,7 +593,7 @@ int main() {
                     "Client received 200 OK for large response");
         size_t header_sep = client_resp.find("\r\n\r\n");
         assert_test(header_sep != std::string::npos, "Client response has header terminator");
-        std::string body_received = client_resp.substr(header_sep + 4);
+        std::string body_received = (header_sep != std::string::npos) ? client_resp.substr(header_sep + 4) : "";
         assert_test(body_received.size() == large_size,
                     "Client received full streamed 256 KB response body",
                     "Got size: " + std::to_string(body_received.size()));
@@ -613,8 +620,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string payload = "key1=value1&key2=value2";
         std::string raw =
@@ -646,8 +653,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         // Header claims Content-Length: 100, but only 10 bytes provided
         std::string raw =
@@ -693,8 +700,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw =
             "GET http://127.0.0.1:" + std::to_string(srv_port) + "/partial HTTP/1.1\r\n"
@@ -750,8 +757,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         // Content-Length exceeds MAX_BODY_BYTES (10 MB + 1 byte)
         size_t oversized = HttpForwarder::MAX_BODY_BYTES + 1;
@@ -780,8 +787,8 @@ int main() {
     {
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw =
             "GET https://example.com/secure/page HTTP/1.1\r\n"
@@ -814,8 +821,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw =
             "GET http://127.0.0.1:" + std::to_string(srv_port) + "/slow HTTP/1.1\r\n"
@@ -850,8 +857,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw =
             "GET http://127.0.0.1:" + std::to_string(srv_port) + "/partial-stall HTTP/1.1\r\n"
@@ -883,8 +890,8 @@ int main() {
         uint16_t srv_port = server.port();
         HttpForwarder forwarder(true);
 
-        int client_pair[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0);
+        int client_pair[2]{-1, -1};
+        verify_ok(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0, "socketpair failed");
 
         std::string raw =
             "POST http://127.0.0.1:" + std::to_string(srv_port) + "/slow-upload HTTP/1.1\r\n"

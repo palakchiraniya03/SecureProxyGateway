@@ -369,6 +369,12 @@ int main() {
         assert_test(client_received == expected_resp,
                     "Client received HTTP/1.1 200 Connection Established");
 
+        // Wait up to 1000ms for mock destination to accept the established connection
+        auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+        while (!server_connected && std::chrono::steady_clock::now() < wait_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
         // Close client to unblock server and forwarder
         close(p[1]);
         client_thread.join();
