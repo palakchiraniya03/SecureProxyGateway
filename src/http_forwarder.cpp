@@ -3,9 +3,12 @@
 #include <iostream>
 #include <cstring>
 #include <cerrno>
+#include <cctype>
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <limits>
+#include <atomic>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -16,6 +19,9 @@
 #include <arpa/inet.h>
 
 namespace {
+
+std::atomic<size_t> s_active_tunnels{0};
+std::atomic<size_t> s_max_tunnels{HttpForwarder::DEFAULT_MAX_CONCURRENT_TUNNELS};
 
 bool iequals(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) {
@@ -167,39 +173,16 @@ bool is_ssrf_safe_ipv6(const struct in6_addr* addr, uint16_t port, bool allow_lo
     if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b &&
         b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
         b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0) {
-        uint32_t ip4 = (static_cast<uint32_t>(b[12]) << 24) |
-                       (static_cast<uint32_t>(b[13]) << 16) |
-                       (static_cast<uint32_t>(b[14]) << 8)  |
-                        static_cast<uint32_t>(b[15]);
-        // Also classify embedded IPv4
-        is_ssrf_safe_ipv4(ip4, port, allow_loopback);
         return false; // Block 64:ff9b::/96
     }
 
     // 2002::/16 (6to4 - RFC 3056)
     if (b[0] == 0x20 && b[1] == 0x02) {
-        uint32_t ip4 = (static_cast<uint32_t>(b[2]) << 24) |
-                       (static_cast<uint32_t>(b[3]) << 16) |
-                       (static_cast<uint32_t>(b[4]) << 8)  |
-                        static_cast<uint32_t>(b[5]);
-        // Also classify embedded IPv4
-        is_ssrf_safe_ipv4(ip4, port, allow_loopback);
         return false; // Block 2002::/16
     }
 
     // 2001::/32 (Teredo - RFC 4380)
     if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x00 && b[3] == 0x00) {
-        uint32_t server_ip4 = (static_cast<uint32_t>(b[4]) << 24) |
-                              (static_cast<uint32_t>(b[5]) << 16) |
-                              (static_cast<uint32_t>(b[6]) << 8)  |
-                               static_cast<uint32_t>(b[7]);
-        uint32_t client_ip4 = (~static_cast<uint32_t>(b[12]) << 24) |
-                              (~static_cast<uint32_t>(b[13]) << 16) |
-                              (~static_cast<uint32_t>(b[14]) << 8)  |
-                               ~static_cast<uint32_t>(b[15]);
-        // Classify embedded IPv4s
-        is_ssrf_safe_ipv4(server_ip4, port, allow_loopback);
-        is_ssrf_safe_ipv4(client_ip4, port, allow_loopback);
         return false; // Block 2001::/32
     }
 
@@ -364,7 +347,12 @@ std::string HttpForwarder::rebuild_request(const HttpRequest& req, std::string_v
         if (iequals(name, "Host") ||
             iequals(name, "Proxy-Authorization") ||
             iequals(name, "Proxy-Connection") ||
-            iequals(name, "Connection")) {
+            iequals(name, "Connection") ||
+            iequals(name, "Expect") ||
+            iequals(name, "Upgrade") ||
+            iequals(name, "TE") ||
+            iequals(name, "Trailer") ||
+            iequals(name, "Keep-Alive")) {
             continue;
         }
         if (iequals(name, "Content-Length")) {
@@ -526,7 +514,12 @@ ForwardResult HttpForwarder::forward(const HttpRequest& req,
         if (now >= connect_deadline) {
             break;
         }
-        dest_fd = connect_with_deadline(safe_ai, connect_deadline);
+        // Per-address attempt budget: ~3 seconds or remaining overall deadline
+        auto addr_deadline = std::min(
+            connect_deadline,
+            now + std::chrono::seconds(3)
+        );
+        dest_fd = connect_with_deadline(safe_ai, addr_deadline);
         if (dest_fd >= 0) {
             break;
         }
@@ -664,6 +657,15 @@ std::string HttpForwarder::make_502_response() {
            "\r\n" + body;
 }
 
+std::string HttpForwarder::make_503_response() {
+    const std::string body = "Service Unavailable\n";
+    return "HTTP/1.1 503 Service Unavailable\r\n"
+           "Content-Type: text/plain\r\n"
+           "Content-Length: " + std::to_string(body.size()) + "\r\n"
+           "Connection: close\r\n"
+           "\r\n" + body;
+}
+
 std::string HttpForwarder::make_504_response() {
     const std::string body = "Gateway Timeout\n";
     return "HTTP/1.1 504 Gateway Timeout\r\n"
@@ -671,4 +673,386 @@ std::string HttpForwarder::make_504_response() {
            "Content-Length: " + std::to_string(body.size()) + "\r\n"
            "Connection: close\r\n"
            "\r\n" + body;
+}
+
+bool HttpForwarder::try_acquire_tunnel() {
+    size_t cur = s_active_tunnels.load(std::memory_order_relaxed);
+    while (true) {
+        if (cur >= s_max_tunnels.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (s_active_tunnels.compare_exchange_weak(cur, cur + 1,
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+}
+
+void HttpForwarder::release_tunnel() {
+    s_active_tunnels.fetch_sub(1, std::memory_order_relaxed);
+}
+
+size_t HttpForwarder::active_tunnels() {
+    return s_active_tunnels.load(std::memory_order_relaxed);
+}
+
+void HttpForwarder::set_max_concurrent_tunnels(size_t max) {
+    s_max_tunnels.store(max, std::memory_order_relaxed);
+}
+
+ForwardResult HttpForwarder::forward_connect(
+    const HttpRequest& req,
+    std::string_view initial_client_data,
+    int client_fd,
+    std::chrono::milliseconds idle_timeout,
+    std::chrono::milliseconds total_timeout) {
+
+    if (req.method != "CONNECT") {
+        return ForwardResult::NotImplemented;
+    }
+
+    // Port restriction: production CONNECT requests allow only 443 and 8443
+    if (!allow_loopback_for_testing_) {
+        if (!is_allowed_connect_port(req.port)) {
+            std::string resp_403 = make_403_response();
+            send(client_fd, resp_403.data(), resp_403.size(), MSG_NOSIGNAL);
+            return ForwardResult::SsrfBlocked;
+        }
+    }
+
+    // 1. Resolve destination hostname using getaddrinfo()
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo* res = nullptr;
+    std::string port_str = std::to_string(req.port);
+
+    int gai_err = getaddrinfo(req.host.c_str(), port_str.c_str(), &hints, &res);
+    if (gai_err != 0 || !res) {
+        std::string resp_502 = make_502_response();
+        send(client_fd, resp_502.data(), resp_502.size(), MSG_NOSIGNAL);
+        return ForwardResult::DnsFailure;
+    }
+
+    // 2. SSRF validation: inspect every resolved address
+    std::vector<struct addrinfo*> safe_addrs;
+    for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        if (is_ssrf_safe(p->ai_addr, p->ai_addrlen, allow_loopback_for_testing_)) {
+            safe_addrs.push_back(p);
+        }
+    }
+
+    if (safe_addrs.empty()) {
+        freeaddrinfo(res);
+        std::string resp_403 = make_403_response();
+        send(client_fd, resp_403.data(), resp_403.size(), MSG_NOSIGNAL);
+        return ForwardResult::SsrfBlocked;
+    }
+
+    // 3. Outbound connect:
+    // - overall outbound connection deadline of ~10 seconds
+    // - per-address attempt budget of ~3 seconds
+    // - try at most 4 validated addresses
+    auto connect_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    constexpr size_t MAX_CONNECT_ADDRS = 4;
+    size_t tried = 0;
+    int dest_fd = -1;
+    bool timed_out = false;
+
+    for (struct addrinfo* safe_ai : safe_addrs) {
+        if (tried++ >= MAX_CONNECT_ADDRS) {
+            break;
+        }
+        auto now = std::chrono::steady_clock::now();
+        if (now >= connect_deadline) {
+            timed_out = true;
+            break;
+        }
+        auto per_addr_deadline = std::min(
+            connect_deadline,
+            now + std::chrono::seconds(3)
+        );
+        dest_fd = connect_with_deadline(safe_ai, per_addr_deadline);
+        if (dest_fd >= 0) {
+            break;
+        }
+    }
+    freeaddrinfo(res);
+
+    if (dest_fd < 0) {
+        if (timed_out || std::chrono::steady_clock::now() >= connect_deadline) {
+            std::string resp_504 = make_504_response();
+            send(client_fd, resp_504.data(), resp_504.size(), MSG_NOSIGNAL);
+            return ForwardResult::Timeout;
+        }
+        std::string resp_502 = make_502_response();
+        send(client_fd, resp_502.data(), resp_502.size(), MSG_NOSIGNAL);
+        return ForwardResult::ConnectFailure;
+    }
+
+    // 4. Send 200 Connection Established once outbound connection is ready
+    const std::string resp_200 = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    if (!send_all(client_fd, resp_200.data(), resp_200.size(), std::chrono::steady_clock::now() + std::chrono::seconds(5))) {
+        close(dest_fd);
+        return ForwardResult::ClientDisconnect;
+    }
+
+    // 5. Bidirectional TCP relay
+    ForwardResult relay_res = relay_tunnel(client_fd, dest_fd, initial_client_data, idle_timeout, total_timeout);
+    close(dest_fd);
+    return relay_res;
+}
+
+ForwardResult HttpForwarder::relay_tunnel(
+    int client_fd,
+    int dest_fd,
+    std::string_view initial_client_data,
+    std::chrono::milliseconds idle_timeout,
+    std::chrono::milliseconds total_timeout) {
+
+    int client_orig_flags = fcntl(client_fd, F_GETFL, 0);
+    int dest_orig_flags = fcntl(dest_fd, F_GETFL, 0);
+
+    if (client_orig_flags >= 0) {
+        fcntl(client_fd, F_SETFL, client_orig_flags | O_NONBLOCK);
+    }
+    if (dest_orig_flags >= 0) {
+        fcntl(dest_fd, F_SETFL, dest_orig_flags | O_NONBLOCK);
+    }
+
+    constexpr size_t BUFFER_SIZE = 16384;
+    std::vector<char> c2d_buf;
+    if (!initial_client_data.empty()) {
+        c2d_buf.assign(initial_client_data.begin(), initial_client_data.end());
+    }
+    size_t c2d_offset = 0;
+    bool client_eof = false;
+    bool client_shutdown_sent = false;
+
+    std::vector<char> d2c_buf;
+    size_t d2c_offset = 0;
+    bool dest_eof = false;
+    bool dest_shutdown_sent = false;
+
+    auto start_time = std::chrono::steady_clock::now();
+    auto last_activity = start_time;
+    auto total_deadline = start_time + total_timeout;
+
+    char read_chunk[BUFFER_SIZE];
+    ForwardResult final_result = ForwardResult::Success;
+
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= total_deadline) {
+            final_result = ForwardResult::Timeout;
+            break;
+        }
+        if (now - last_activity >= idle_timeout) {
+            final_result = ForwardResult::Timeout;
+            break;
+        }
+
+        auto rem_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(total_deadline - now).count();
+        auto rem_idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>((last_activity + idle_timeout) - now).count();
+
+        long long poll_ms_ll = std::min(rem_total_ms, rem_idle_ms);
+        if (poll_ms_ll <= 0) {
+            final_result = ForwardResult::Timeout;
+            break;
+        }
+        int poll_ms = static_cast<int>(std::min(poll_ms_ll, static_cast<long long>(std::numeric_limits<int>::max())));
+
+        struct pollfd pfds[2]{};
+        pfds[0].fd = client_fd;
+        pfds[1].fd = dest_fd;
+
+        // Client socket events
+        if (!client_eof && c2d_offset >= c2d_buf.size()) {
+            pfds[0].events |= POLLIN;
+        }
+        if (d2c_offset < d2c_buf.size()) {
+            pfds[0].events |= POLLOUT;
+        }
+
+        // Destination socket events
+        if (!dest_eof && d2c_offset >= d2c_buf.size()) {
+            pfds[1].events |= POLLIN;
+        }
+        if (c2d_offset < c2d_buf.size()) {
+            pfds[1].events |= POLLOUT;
+        }
+
+        if (pfds[1].events == 0) pfds[1].fd = -1;
+
+        // Termination checks: Both sides reached EOF and buffered data drained
+        if (client_eof && c2d_offset >= c2d_buf.size() && dest_eof && d2c_offset >= d2c_buf.size()) {
+            break;
+        }
+        if (pfds[0].events == 0 && pfds[1].events == 0) {
+            break;
+        }
+
+        int poll_res = poll(pfds, 2, poll_ms);
+        if (poll_res < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            final_result = ForwardResult::RecvFailure;
+            break;
+        }
+        if (poll_res == 0) {
+            final_result = ForwardResult::Timeout;
+            break;
+        }
+
+        // 1. Inspect immediately for fatal error (e.g. RST/POLLERR) or invalid descriptor
+        bool fatal = false;
+        for (int i = 0; i < 2; ++i) {
+            short r = pfds[i].revents;
+            if (r & (POLLNVAL | POLLERR)) {
+                fatal = true;
+                final_result = ForwardResult::RecvFailure;
+                break;
+            }
+        }
+
+        if (fatal) {
+            break;
+        }
+
+        // Writes (POLLOUT)
+        if ((pfds[1].revents & POLLOUT) && c2d_offset < c2d_buf.size()) {
+            ssize_t s = send(dest_fd, c2d_buf.data() + c2d_offset, c2d_buf.size() - c2d_offset, MSG_NOSIGNAL);
+            if (s > 0) {
+                c2d_offset += static_cast<size_t>(s);
+                last_activity = std::chrono::steady_clock::now();
+                if (c2d_offset >= c2d_buf.size()) {
+                    c2d_buf.clear();
+                    c2d_offset = 0;
+                    if (client_eof && !client_shutdown_sent) {
+                        shutdown(dest_fd, SHUT_WR);
+                        client_shutdown_sent = true;
+                    }
+                }
+            } else if (s < 0) {
+                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    final_result = ForwardResult::SendFailure;
+                    break;
+                }
+            }
+        }
+
+        if ((pfds[0].revents & POLLOUT) && d2c_offset < d2c_buf.size()) {
+            ssize_t s = send(client_fd, d2c_buf.data() + d2c_offset, d2c_buf.size() - d2c_offset, MSG_NOSIGNAL);
+            if (s > 0) {
+                d2c_offset += static_cast<size_t>(s);
+                last_activity = std::chrono::steady_clock::now();
+                if (d2c_offset >= d2c_buf.size()) {
+                    d2c_buf.clear();
+                    d2c_offset = 0;
+                    if (dest_eof && !dest_shutdown_sent) {
+                        shutdown(client_fd, SHUT_WR);
+                        dest_shutdown_sent = true;
+                    }
+                }
+            } else if (s < 0) {
+                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    final_result = ForwardResult::ClientDisconnect;
+                    break;
+                }
+            }
+        }
+
+        // Reads (POLLIN / POLLHUP / POLLERR)
+        if ((pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) && !client_eof && c2d_offset >= c2d_buf.size()) {
+            ssize_t n = recv(client_fd, read_chunk, sizeof(read_chunk), 0);
+            if (n > 0) {
+                c2d_buf.assign(read_chunk, read_chunk + n);
+                c2d_offset = 0;
+                last_activity = std::chrono::steady_clock::now();
+            } else if (n == 0) {
+                client_eof = true;
+                if (c2d_offset >= c2d_buf.size() && !client_shutdown_sent) {
+                    shutdown(dest_fd, SHUT_WR);
+                    client_shutdown_sent = true;
+                }
+            } else {
+                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    client_eof = true;
+                    final_result = ForwardResult::ClientDisconnect;
+                    break;
+                }
+            }
+        }
+
+        if ((pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) && !dest_eof && d2c_offset >= d2c_buf.size()) {
+            ssize_t n = recv(dest_fd, read_chunk, sizeof(read_chunk), 0);
+            if (n > 0) {
+                d2c_buf.assign(read_chunk, read_chunk + n);
+                d2c_offset = 0;
+                last_activity = std::chrono::steady_clock::now();
+            } else if (n == 0) {
+                dest_eof = true;
+                if (d2c_offset >= d2c_buf.size() && !dest_shutdown_sent) {
+                    shutdown(client_fd, SHUT_WR);
+                    dest_shutdown_sent = true;
+                }
+            } else {
+                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    dest_eof = true;
+                    final_result = ForwardResult::RecvFailure;
+                    break;
+                }
+            }
+        }
+
+        // 4. Handle remaining unconsumed POLLHUP where POLLIN was not polled
+        for (int i = 0; i < 2; ++i) {
+            short r = pfds[i].revents;
+            bool already_eof = (i == 0 ? client_eof : dest_eof);
+            if ((r & POLLHUP) && !(pfds[i].events & POLLIN)) {
+                if (!already_eof) {
+                    if (i == 0) {
+                        if (!(pfds[1].revents & POLLOUT)) {
+                            fatal = true;
+                            final_result = ForwardResult::RecvFailure;
+                            break;
+                        }
+                    } else {
+                        if (!(pfds[0].revents & POLLOUT)) {
+                            fatal = true;
+                            final_result = ForwardResult::RecvFailure;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if (i == 0 && !dest_eof && d2c_offset >= d2c_buf.size()) {
+                    fatal = true;
+                    final_result = ForwardResult::RecvFailure;
+                    break;
+                }
+                if (i == 1 && c2d_offset < c2d_buf.size()) {
+                    fatal = true;
+                    final_result = ForwardResult::SendFailure;
+                    break;
+                }
+            }
+        }
+        if (fatal) {
+            break;
+        }
+    }
+
+    if (client_orig_flags >= 0) {
+        fcntl(client_fd, F_SETFL, client_orig_flags);
+    }
+    if (dest_orig_flags >= 0) {
+        fcntl(dest_fd, F_SETFL, dest_orig_flags);
+    }
+
+    return final_result;
 }

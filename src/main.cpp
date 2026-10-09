@@ -218,13 +218,28 @@ void process_client(int client_fd, const std::string& client_ip, uint16_t client
     }
 
     if (req.method == "CONNECT") {
-        std::string resp_501 = "HTTP/1.1 501 Not Implemented\r\n"
-                               "Content-Type: text/plain\r\n"
-                               "Content-Length: 16\r\n"
-                               "Connection: close\r\n"
-                               "\r\n"
-                               "Not Implemented\n";
-        send(client_fd, resp_501.data(), resp_501.size(), 0);
+        if (!HttpForwarder::try_acquire_tunnel()) {
+            std::string resp_503 = HttpForwarder::make_503_response();
+            send(client_fd, resp_503.data(), resp_503.size(), MSG_NOSIGNAL);
+            close(client_fd);
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                std::cout << "Closed client connection (concurrent tunnel limit reached)." << std::endl;
+            }
+            return;
+        }
+
+        struct TunnelGuard {
+            ~TunnelGuard() { HttpForwarder::release_tunnel(); }
+        } tunnel_guard;
+
+        std::string initial_data = (request_buffer.size() > req.header_length)
+            ? request_buffer.substr(req.header_length)
+            : "";
+
+        HttpForwarder forwarder;
+        forwarder.forward_connect(req, initial_data, client_fd);
+
         close(client_fd);
         {
             std::lock_guard<std::mutex> lock(g_log_mutex);
@@ -304,9 +319,9 @@ int main() {
         return 1;
     }
 
-    // Initialize thread pool with 4 worker threads
-    ThreadPool pool(4);
-    std::cout << "Thread pool started with 4 worker threads." << std::endl;
+    // Initialize thread pool with 32 worker threads
+    ThreadPool pool(32);
+    std::cout << "Thread pool started with 32 worker threads." << std::endl;
     std::cout << "Server listening on " << server_ip << ":" << server_port << "..." << std::endl;
 
     while (g_running) {
